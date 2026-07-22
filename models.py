@@ -36,7 +36,16 @@ class TeamStats:
     attack_strength: float = 1.0
     defense_strength: float = 1.0
 
+    # v1.1 EKLEME: standings tabanlı (sezon ortalaması) hazır değerler.
+    # Doluysa avg_goals_for()/avg_goals_against() bunları döndürür,
+    # boşsa (None) eski davranışa (last5_all'dan hesaplama) devam eder.
+    season_avg_goals_for: Optional[float] = None
+    season_avg_goals_against: Optional[float] = None
+    season_form_score: Optional[float] = None
+
     def form_score(self, matches: Optional[List[MatchResult]] = None) -> float:
+        if matches is None and self.season_form_score is not None:
+            return self.season_form_score
         m = matches if matches is not None else self.last5_all
         if not m:
             return 0.5
@@ -47,12 +56,16 @@ class TeamStats:
         return score / max_score if max_score else 0.5
 
     def avg_goals_for(self, matches: Optional[List[MatchResult]] = None) -> float:
+        if matches is None and self.season_avg_goals_for is not None:
+            return self.season_avg_goals_for
         m = matches if matches is not None else self.last5_all
         if not m:
             return 1.2
         return sum(x.goals_for for x in m) / len(m)
 
     def avg_goals_against(self, matches: Optional[List[MatchResult]] = None) -> float:
+        if matches is None and self.season_avg_goals_against is not None:
+            return self.season_avg_goals_against
         m = matches if matches is not None else self.last5_all
         if not m:
             return 1.2
