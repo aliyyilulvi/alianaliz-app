@@ -1,0 +1,173 @@
+#:kivy 2.2.1
+# ---------------------------------------------------------------------
+# alianaliz.kv - Mor + Turuncu tema
+# Renk paleti:
+#   Arka plan (koyu mor):     #241934 -> (0.141, 0.098, 0.204, 1)
+#   İkincil panel (mor):      #372116 -> (0.216, 0.086, 0.325, 1)
+#   Vurgu (turuncu):          #F2994A -> (0.949, 0.600, 0.290, 1)
+#   Koyu turuncu (buton):     #D97A2B -> (0.851, 0.478, 0.169, 1)
+#   Metin (açık lavanta):     #F7F2FA -> (0.969, 0.949, 0.980, 1)
+# ---------------------------------------------------------------------
+
+<AliAnalizScreenManager>:
+
+<BultenScreen>:
+    name: "bulten"
+    canvas.before:
+        Color:
+            rgba: 0.141, 0.098, 0.204, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+    BoxLayout:
+        orientation: "vertical"
+        padding: dp(14)
+        spacing: dp(8)
+
+        Label:
+            text: "ALIANALIZ"
+            font_size: "28sp"
+            bold: True
+            color: 0.949, 0.600, 0.290, 1
+            size_hint_y: None
+            height: dp(42)
+
+        Label:
+            text: "Istatistiksel Mac Analiz Motoru (Poisson Modeli)"
+            font_size: "12sp"
+            color: 0.969, 0.949, 0.980, 0.75
+            size_hint_y: None
+            height: dp(20)
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(46)
+            spacing: dp(6)
+
+            Button:
+                text: "<"
+                size_hint_x: None
+                width: dp(48)
+                background_normal: ""
+                background_color: 0.216, 0.086, 0.325, 1
+                color: 0.949, 0.600, 0.290, 1
+                bold: True
+                on_release: root.shift_date(-1)
+
+            Label:
+                text: root.date_display
+                color: 0.969, 0.949, 0.980, 1
+                font_size: "14sp"
+                halign: "center"
+                valign: "middle"
+                text_size: self.size
+
+            Button:
+                text: ">"
+                size_hint_x: None
+                width: dp(48)
+                background_normal: ""
+                background_color: 0.216, 0.086, 0.325, 1
+                color: 0.949, 0.600, 0.290, 1
+                bold: True
+                on_release: root.shift_date(1)
+
+        Button:
+            text: "Yenile"
+            size_hint_y: None
+            height: dp(46)
+            background_normal: ""
+            background_color: 0.949, 0.600, 0.290, 1
+            color: 0.141, 0.098, 0.204, 1
+            bold: True
+            font_size: "14sp"
+            on_release: root.refresh_fixtures()
+
+        Label:
+            text: root.status_text
+            size_hint_y: None
+            height: max(dp(24), self.texture_size[1] + dp(8))
+            color: 0.949, 0.600, 0.290, 1
+            font_size: "12sp"
+            halign: "left"
+            valign: "top"
+            text_size: self.width, None
+
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                id: match_list
+                orientation: "vertical"
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(8)
+                padding: [0, dp(4)]
+
+        Label:
+            text: "Uyari: Bu uygulama bahis sitelerinden veri cekmez. Tum tahminler istatistiksel olasiliktir, garanti degildir."
+            size_hint_y: None
+            height: dp(36)
+            font_size: "9sp"
+            color: 0.969, 0.949, 0.980, 0.55
+            halign: "center"
+            text_size: self.width, None
+
+
+<AnalizScreen>:
+    name: "analiz"
+    canvas.before:
+        Color:
+            rgba: 0.141, 0.098, 0.204, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+    BoxLayout:
+        orientation: "vertical"
+        padding: dp(14)
+        spacing: dp(10)
+
+        BoxLayout:
+            size_hint_y: None
+            height: dp(44)
+            spacing: dp(8)
+
+            Button:
+                text: "< Bultene Don"
+                size_hint_x: None
+                width: dp(130)
+                background_normal: ""
+                background_color: 0.216, 0.086, 0.325, 1
+                color: 0.949, 0.600, 0.290, 1
+                on_release: app.root.current = "bulten"
+
+        Label:
+            text: root.home_team + "  vs  " + root.away_team
+            bold: True
+            color: 0.969, 0.949, 0.980, 1
+            font_size: "16sp"
+            size_hint_y: None
+            height: dp(50)
+            halign: "center"
+            valign: "middle"
+            text_size: self.width, None
+
+        Label:
+            text: root.status_text
+            size_hint_y: None
+            height: max(dp(26), self.texture_size[1] + dp(10))
+            color: 0.949, 0.600, 0.290, 1
+            halign: "left"
+            valign: "top"
+            text_size: self.width, None
+
+        ScrollView:
+            do_scroll_x: False
+            BoxLayout:
+                id: results_box
+                orientation: "vertical"
+                size_hint_y: None
+                height: self.minimum_height
+                spacing: dp(4)
+                padding: [dp(4), dp(6)]
