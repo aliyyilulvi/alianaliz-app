@@ -5,17 +5,14 @@ data_fetcher.py
 AliAnaliz uygulamasının veri toplama katmanı.
 Veri kaynağı: BigBallsData API (bigballsdata.com) - ücretsiz plan.
 
-ÖNEMLİ TASARIM KARARI:
-Bu modül KESİNLİKLE bahis sitelerinden veri scrape etmez.
-  1) Fikstür + geçmiş maç sonuçları  -> BigBallsData API'si
-  2) Hava durumu                     -> Open-Meteo API (anahtar gerekmez)
-  3) Kadro piyasa değeri             -> data/market_values.csv (manuel, opsiyonel)
-
-API ANAHTARI: Mobilde ortam değişkeni çalışmadığı için _HARDCODED_API_KEY'e gömülüdür.
-
 AĞ / DNS NOTU: Sistem DNS çözümleyicisi bazı cihazlarda bozuk olabiliyor.
 Sırasıyla 3 yedek yöntem deneniyor: Android native (pyjnius), DNS-over-TCP,
 Cloudflare DoH.
+
+v1.1 NOTU: Takım formu çekilemediğinde (fetch_team_recent_matches) artık
+hata ayıklama bilgisi (_last_team_fetch_debug) tutuluyor ve build_fixture
+bu bilgiyi görünür bir hataya çeviriyor - böylece "neden veri gelmiyor"
+sorusuna tahminle değil kesin teşhisle cevap verebiliyoruz.
 """
 
 import os
@@ -195,7 +192,6 @@ FREE_LEAGUES = ["epl", "laliga", "bundesliga", "serie_a", "ligue1", "cl", "mls"]
 
 
 def _extract_team_name(side) -> str:
-    """API bazen {'team_name': X} bazen düz string dönebiliyor; ikisini de destekler."""
     if isinstance(side, dict):
         return side.get("team_name") or side.get("name") or ""
     if isinstance(side, str):
@@ -264,11 +260,6 @@ def _fetch_one_league(league_code: str, date_str: Optional[str]) -> List[dict]:
 # ----------------------------------------------------------------------
 def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 80,
                              date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[dict]:
-    """
-    Ligleri AYNI ANDA (paralel) sorgular. competition_code boşsa TÜM
-    ücretsiz ligler taranır. BigBallsData'nın /v1/matches uç noktası tek
-    bir 'date' parametresi alır (aralık değil) - date_from kullanılır.
-    """
     code = (competition_code or "").strip().lower()
     codes = [code] if code else FREE_LEAGUES
     date_str = date_from or date_to
@@ -292,14 +283,23 @@ def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 80,
 # ----------------------------------------------------------------------
 # 2) TAKIM FORMU (son maçlar) - /v1/teams/{id}/form kullanır
 # ----------------------------------------------------------------------
+_last_team_fetch_debug = []
+
+
 def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult]:
     try:
         url = f"{BBS_BASE}/v1/teams/{team_id}/form"
         params = {"limit": limit}
         resp = _get_with_retry(url, params)
-        if resp is None or resp.status_code != 200:
+        if resp is None:
+            _last_team_fetch_debug.append(f"id={team_id}: yanit yok (network)")
+            return []
+        if resp.status_code != 200:
+            _last_team_fetch_debug.append(f"id={team_id}: HTTP {resp.status_code} - {resp.text[:150]}")
             return []
         data = resp.json().get("data", [])
+        if not data:
+            _last_team_fetch_debug.append(f"id={team_id}: bos liste dondu (200 ama veri yok)")
 
         results = []
         for row in data:
@@ -312,8 +312,6 @@ def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult
                 continue
 
             is_home = result in ("W", "D", "L") and home_name is not None
-            # 'result' zaten BU takımın perspektifinden - hangi tarafta
-            # olduğunu skor eşleşmesiyle çıkarmaya çalışıyoruz.
             if is_home:
                 opponent = away_name or "?"
                 goals_for, goals_against = hg, ag
@@ -328,7 +326,8 @@ def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult
             ))
         results.sort(key=lambda r: r.date, reverse=True)
         return results
-    except Exception:
+    except Exception as e:
+        _last_team_fetch_debug.append(f"id={team_id}: istisna {type(e).__name__}: {e}")
         return []
 
 
@@ -411,6 +410,9 @@ def fetch_weather(city_name: str, match_date: str) -> WeatherInfo:
 def build_fixture(raw_fixture: dict) -> Fixture:
     home_stats = build_team_stats(raw_fixture["home"], raw_fixture["home_id"])
     away_stats = build_team_stats(raw_fixture["away"], raw_fixture["away_id"])
+
+    if not home_stats.last5_all and not away_stats.last5_all and _last_team_fetch_debug:
+        raise RuntimeError("Takim verisi alinamadi -> " + " | ".join(_last_team_fetch_debug[-4:]))
 
     match_date = raw_fixture["utc_date"][:10] if raw_fixture.get("utc_date") else \
         datetime.utcnow().strftime("%Y-%m-%d")
