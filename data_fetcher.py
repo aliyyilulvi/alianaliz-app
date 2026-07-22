@@ -5,15 +5,14 @@ data_fetcher.py
 AliAnaliz uygulamasının veri toplama katmanı.
 Veri kaynağı: BigBallsData API (bigballsdata.com) - ücretsiz plan.
 
-v1.2 NOTU (ÖNEMLİ MİMARİ DEĞİŞİKLİĞİ):
-BigBallsData'nın /v1/matches uç noktası takımlar için ID VERMİYOR,
-sadece isim veriyor; isimle ID bulunabilecek bir arama uç noktası da
-yok. Bu yüzden /v1/teams/{id}/form kullanılamıyor (400 hatası veriyordu).
-Bunun yerine /v1/standings (lig puan durumu) kullanılıyor - bu uç nokta
-SADECE lig kodu ile sorgulanıyor, takım ID'sine ihtiyaç duymuyor, ve
-her takımın SEZON ORTALAMASI gol/maç verisini (played, goals_for,
-goals_against) veriyor. İstatistiksel olarak bu, "son 5 maç" yerine
-tüm sezon verisine dayandığı için daha sağlam bir temel oluşturuyor.
+v1.3 NOTU:
+BigBallsData'nın ANA SAYFASINA göre sadece 5 "amiral gemisi" lig
+(Premier League, La Liga, Bundesliga, Ligue 1, Serie A) TAM kapsama
+sahip (skor+oran+kadro+istatistik+puan durumu+olaylar). MLS, Şampiyonlar
+Ligi ve Dünya Kupası'nın bazı özellikleri (puan durumu dahil) "yol
+haritasında" - yani henüz eklenmemiş. Bu yüzden puan durumu bulunamayan
+liglerde HATA GÖSTERMİYORUZ, nazikçe nötr (1.2 gol ortalaması) tahmine
+düşüyoruz - Avrupa'nın 5 büyük liginde tam, MLS/CL'de nötr analiz olur.
 
 AĞ / DNS NOTU: Sistem DNS çözümleyicisi bazı cihazlarda bozuk olabiliyor.
 Sırasıyla 3 yedek yöntem deneniyor: Android native (pyjnius), DNS-over-TCP,
@@ -193,7 +192,7 @@ def _get_with_retry(url: str, params: dict = None, max_retries: int = 3, timeout
     return last_resp
 
 
-FREE_LEAGUES = ["epl", "laliga", "bundesliga", "serie_a", "ligue1", "cl", "mls"]
+FREE_LEAGUES = ["epl", "laliga", "bundesliga", "ligue1", "serie_a", "mls", "cl"]
 
 
 def _extract_team_name(side) -> str:
@@ -287,8 +286,6 @@ _last_team_fetch_debug = []
 
 
 def _names_match(a: str, b: str) -> bool:
-    """Esnek isim eşleştirme - 'Inter Miami CF Inter Miami CF' gibi
-    tekrarlı/farklı biçimlerde gelen isimlere karşı toleranslı."""
     a_norm = a.strip().lower()
     b_norm = b.strip().lower()
     if a_norm == b_norm:
@@ -318,6 +315,12 @@ def _fetch_standings(league_code: str) -> list:
 
 
 def build_team_stats(team_name: str, league_code: str) -> TeamStats:
+    """
+    Lig puan durumundan (standings) sezon ortalaması gol istatistiği
+    çeker. Lig için veri yoksa (örn. MLS - henüz desteklenmiyor) HATA
+    VERMEZ, TeamStats'i boş bırakır; modül otomatik olarak nötr (1.2)
+    varsayılana düşer.
+    """
     rows = _fetch_standings(league_code)
     stats = TeamStats(name=team_name)
 
@@ -338,7 +341,10 @@ def build_team_stats(team_name: str, league_code: str) -> TeamStats:
         actual_points = won * 3 + drawn
         stats.season_form_score = actual_points / max_points if max_points else 0.5
     else:
-        _last_team_fetch_debug.append(f"'{team_name}' standings'de bulunamadi (lig: {league_code})")
+        available_names = [r.get("team_name", "?") for r in rows][:8]
+        _last_team_fetch_debug.append(
+            f"'{team_name}' bulunamadi (lig: {league_code}, satir sayisi: {len(rows)}, mevcut isimler: {available_names})"
+        )
 
     stats.squad_market_value_eur = load_market_value(team_name)
     return stats
@@ -418,9 +424,6 @@ def build_fixture(raw_fixture: dict) -> Fixture:
     league_code = raw_fixture.get("league", "epl")
     home_stats = build_team_stats(raw_fixture["home"], league_code)
     away_stats = build_team_stats(raw_fixture["away"], league_code)
-
-    if home_stats.season_avg_goals_for is None and away_stats.season_avg_goals_for is None and _last_team_fetch_debug:
-        raise RuntimeError("Takim istatistigi alinamadi -> " + " | ".join(_last_team_fetch_debug[-4:]))
 
     match_date = raw_fixture["utc_date"][:10] if raw_fixture.get("utc_date") else \
         datetime.utcnow().strftime("%Y-%m-%d")
