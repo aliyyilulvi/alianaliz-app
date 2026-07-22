@@ -1,0 +1,44 @@
+name: AliAnaliz APK Derle
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Sistem bağımlılıklarını kur
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git zip unzip openjdk-17-jdk autoconf libtool \
+            pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev \
+            automake build-essential
+
+      - name: Buildozer ve Cython kur
+        run: |
+          python3.11 -m pip install --upgrade pip
+          python3.11 -m pip install buildozer cython "python-for-android==2024.1.21"
+
+      - name: APK'yı derle
+        run: |
+          echo "cython>=0.29.36" > /tmp/pip-constraints.txt
+          export PIP_CONSTRAINT=/tmp/pip-constraints.txt
+          export PATH="$(dirname $(which python3.11)):$PATH"
+          export JAVA_HOME=/usr/lib/jvm/temurin-17-jdk-amd64
+          yes | buildozer -v android debug
+
+      - name: APK'yı yükle (indirilebilir çıktı olarak)
+        uses: actions/upload-artifact@v4
+        with:
+          name: alianaliz-apk
+          path: bin/*.apk
