@@ -5,14 +5,19 @@ data_fetcher.py
 AliAnaliz uygulamasının veri toplama katmanı.
 Veri kaynağı: BigBallsData API (bigballsdata.com) - ücretsiz plan.
 
+v1.2 NOTU (ÖNEMLİ MİMARİ DEĞİŞİKLİĞİ):
+BigBallsData'nın /v1/matches uç noktası takımlar için ID VERMİYOR,
+sadece isim veriyor; isimle ID bulunabilecek bir arama uç noktası da
+yok. Bu yüzden /v1/teams/{id}/form kullanılamıyor (400 hatası veriyordu).
+Bunun yerine /v1/standings (lig puan durumu) kullanılıyor - bu uç nokta
+SADECE lig kodu ile sorgulanıyor, takım ID'sine ihtiyaç duymuyor, ve
+her takımın SEZON ORTALAMASI gol/maç verisini (played, goals_for,
+goals_against) veriyor. İstatistiksel olarak bu, "son 5 maç" yerine
+tüm sezon verisine dayandığı için daha sağlam bir temel oluşturuyor.
+
 AĞ / DNS NOTU: Sistem DNS çözümleyicisi bazı cihazlarda bozuk olabiliyor.
 Sırasıyla 3 yedek yöntem deneniyor: Android native (pyjnius), DNS-over-TCP,
 Cloudflare DoH.
-
-v1.1 NOTU: Takım formu çekilemediğinde (fetch_team_recent_matches) artık
-hata ayıklama bilgisi (_last_team_fetch_debug) tutuluyor ve build_fixture
-bu bilgiyi görünür bir hataya çeviriyor - böylece "neden veri gelmiyor"
-sorusuna tahminle değil kesin teşhisle cevap verebiliyoruz.
 """
 
 import os
@@ -199,12 +204,6 @@ def _extract_team_name(side) -> str:
     return ""
 
 
-def _extract_team_id(side) -> Optional[str]:
-    if isinstance(side, dict):
-        return side.get("team_id") or side.get("id")
-    return None
-
-
 def _fetch_one_league(league_code: str, date_str: Optional[str]) -> List[dict]:
     try:
         url = f"{BBS_BASE}/v1/matches"
@@ -240,10 +239,10 @@ def _fetch_one_league(league_code: str, date_str: Optional[str]) -> List[dict]:
             results.append({
                 "home": home_name,
                 "away": away_name,
-                "home_id": _extract_team_id(home_side) or home_name,
-                "away_id": _extract_team_id(away_side) or away_name,
+                "home_id": home_name,
+                "away_id": away_name,
                 "utc_date": m.get("start_time", ""),
-                "league": league_code.upper(),
+                "league": league_code,
                 "status": status,
                 "home_goals": home_goals,
                 "away_goals": away_goals,
@@ -281,64 +280,72 @@ def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 80,
 
 
 # ----------------------------------------------------------------------
-# 2) TAKIM FORMU (son maçlar) - /v1/teams/{id}/form kullanır
+# 2) TAKIM İSTATİSTİKLERİ - /v1/standings kullanır (ID GEREKTİRMEZ)
 # ----------------------------------------------------------------------
+_standings_cache = {}
 _last_team_fetch_debug = []
 
 
-def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult]:
+def _names_match(a: str, b: str) -> bool:
+    """Esnek isim eşleştirme - 'Inter Miami CF Inter Miami CF' gibi
+    tekrarlı/farklı biçimlerde gelen isimlere karşı toleranslı."""
+    a_norm = a.strip().lower()
+    b_norm = b.strip().lower()
+    if a_norm == b_norm:
+        return True
+    return a_norm in b_norm or b_norm in a_norm
+
+
+def _fetch_standings(league_code: str) -> list:
+    if league_code in _standings_cache:
+        return _standings_cache[league_code]
     try:
-        url = f"{BBS_BASE}/v1/teams/{team_id}/form"
-        params = {"limit": limit}
+        url = f"{BBS_BASE}/v1/standings"
+        params = {"league": league_code, "sport": "football"}
         resp = _get_with_retry(url, params)
-        if resp is None:
-            _last_team_fetch_debug.append(f"id={team_id}: yanit yok (network)")
+        if resp is None or resp.status_code != 200:
+            _last_team_fetch_debug.append(f"standings({league_code}): HTTP {resp.status_code if resp else '?'}")
+            _standings_cache[league_code] = []
             return []
-        if resp.status_code != 200:
-            _last_team_fetch_debug.append(f"id={team_id}: HTTP {resp.status_code} - {resp.text[:150]}")
-            return []
-        data = resp.json().get("data", [])
-        if not data:
-            _last_team_fetch_debug.append(f"id={team_id}: bos liste dondu (200 ama veri yok)")
-
-        results = []
-        for row in data:
-            home_name = row.get("home")
-            away_name = row.get("away")
-            hg = row.get("home_score")
-            ag = row.get("away_score")
-            result = row.get("result")
-            if hg is None or ag is None or result is None:
-                continue
-
-            is_home = result in ("W", "D", "L") and home_name is not None
-            if is_home:
-                opponent = away_name or "?"
-                goals_for, goals_against = hg, ag
-            else:
-                opponent = home_name or "?"
-                goals_for, goals_against = ag, hg
-
-            results.append(MatchResult(
-                opponent=opponent, home=bool(is_home),
-                goals_for=goals_for, goals_against=goals_against,
-                date=row.get("date", "")
-            ))
-        results.sort(key=lambda r: r.date, reverse=True)
-        return results
+        data = resp.json().get("data", {})
+        rows = data.get("rows", [])
+        _standings_cache[league_code] = rows
+        return rows
     except Exception as e:
-        _last_team_fetch_debug.append(f"id={team_id}: istisna {type(e).__name__}: {e}")
+        _last_team_fetch_debug.append(f"standings({league_code}): istisna {type(e).__name__}: {e}")
+        _standings_cache[league_code] = []
         return []
 
 
-def build_team_stats(team_name: str, team_id: str) -> TeamStats:
-    all_recent = fetch_team_recent_matches(team_id, limit=10)
-    last5 = all_recent[:5]
-    home_or_away_specific = [m for m in all_recent if m.home][:3]
+def build_team_stats(team_name: str, league_code: str) -> TeamStats:
+    rows = _fetch_standings(league_code)
+    stats = TeamStats(name=team_name)
 
-    stats = TeamStats(name=team_name, last5_all=last5, last3_home_or_away=home_or_away_specific)
+    match_row = None
+    for row in rows:
+        row_name = row.get("team_name", "")
+        if _names_match(row_name, team_name):
+            match_row = row
+            break
+
+    if match_row and match_row.get("played", 0) > 0:
+        played = match_row["played"]
+        stats.season_avg_goals_for = match_row.get("goals_for", 0) / played
+        stats.season_avg_goals_against = match_row.get("goals_against", 0) / played
+        won = match_row.get("won", 0)
+        drawn = match_row.get("drawn", 0)
+        max_points = played * 3
+        actual_points = won * 3 + drawn
+        stats.season_form_score = actual_points / max_points if max_points else 0.5
+    else:
+        _last_team_fetch_debug.append(f"'{team_name}' standings'de bulunamadi (lig: {league_code})")
+
     stats.squad_market_value_eur = load_market_value(team_name)
     return stats
+
+
+def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult]:
+    return []
 
 
 def fetch_head_to_head(match_id: str, limit: int = 5) -> HeadToHead:
@@ -408,11 +415,12 @@ def fetch_weather(city_name: str, match_date: str) -> WeatherInfo:
 
 
 def build_fixture(raw_fixture: dict) -> Fixture:
-    home_stats = build_team_stats(raw_fixture["home"], raw_fixture["home_id"])
-    away_stats = build_team_stats(raw_fixture["away"], raw_fixture["away_id"])
+    league_code = raw_fixture.get("league", "epl")
+    home_stats = build_team_stats(raw_fixture["home"], league_code)
+    away_stats = build_team_stats(raw_fixture["away"], league_code)
 
-    if not home_stats.last5_all and not away_stats.last5_all and _last_team_fetch_debug:
-        raise RuntimeError("Takim verisi alinamadi -> " + " | ".join(_last_team_fetch_debug[-4:]))
+    if home_stats.season_avg_goals_for is None and away_stats.season_avg_goals_for is None and _last_team_fetch_debug:
+        raise RuntimeError("Takim istatistigi alinamadi -> " + " | ".join(_last_team_fetch_debug[-4:]))
 
     match_date = raw_fixture["utc_date"][:10] if raw_fixture.get("utc_date") else \
         datetime.utcnow().strftime("%Y-%m-%d")
