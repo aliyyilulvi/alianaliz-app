@@ -3,31 +3,28 @@
 data_fetcher.py
 ----------------
 AliAnaliz uygulamasının veri toplama katmanı.
-Veri kaynağı: BigBallsData API (bigballsdata.com) - ücretsiz plan.
+Veri kaynağı: API-Football (api-football.com) - ücretsiz plan.
 
-v1.3 NOTU:
-BigBallsData'nın ANA SAYFASINA göre sadece 5 "amiral gemisi" lig
-(Premier League, La Liga, Bundesliga, Ligue 1, Serie A) TAM kapsama
-sahip (skor+oran+kadro+istatistik+puan durumu+olaylar). MLS, Şampiyonlar
-Ligi ve Dünya Kupası'nın bazı özellikleri (puan durumu dahil) "yol
-haritasında" - yani henüz eklenmemiş. Bu yüzden puan durumu bulunamayan
-liglerde HATA GÖSTERMİYORUZ, nazikçe nötr (1.2 gol ortalaması) tahmine
-düşüyoruz - Avrupa'nın 5 büyük liginde tam, MLS/CL'de nötr analiz olur.
+v2.0 - MİMARİ DEĞİŞİKLİĞİ:
+Artık kendi Poisson modelimizi BESLEMEK için ham istatistik toplamıyoruz.
+API-Football'ın KENDİ hazır "/predictions" motoru kullanılıyor - bu,
+6 farklı algoritma ile hesaplanmış kazanan/beraberlik/deplasman yüzdeleri,
+alt/üst tahmini, hücum/savunma gücü karşılaştırması ve H2H veriyor.
+1200+ lig kapsıyor (MLS dahil).
 
-AĞ / DNS NOTU: Sistem DNS çözümleyicisi bazı cihazlarda bozuk olabiliyor.
-Sırasıyla 3 yedek yöntem deneniyor: Android native (pyjnius), DNS-over-TCP,
-Cloudflare DoH.
+ÖNEMLİ: Ücretsiz planda GÜNDE SADECE 100 İSTEK var (dakika değil, gün).
+Bu yüzden:
+  - Bülten yüklerken TEK bir istek atılır (/fixtures?date=X, tüm ligler).
+  - Analiz sadece kullanıcı "Analiz Et"e bastığında (1 istek) yapılır.
 """
 
 import os
-import csv
 import socket
 import struct
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import urllib3.util.connection as _urllib3_cn
@@ -70,7 +67,6 @@ def _parse_dns_response(data: bytes) -> list:
     while data[idx] != 0:
         idx += data[idx] + 1
     idx += 5
-
     ips = []
     for _ in range(ancount):
         if data[idx] & 0xC0 == 0xC0:
@@ -92,18 +88,15 @@ def _resolve_via_dns_tcp(hostname: str, dns_server: str = "8.8.8.8", port: int =
     try:
         query = _build_dns_query(hostname)
         tcp_query = struct.pack(">H", len(query)) + query
-
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         try:
             sock.connect((dns_server, port))
             sock.sendall(tcp_query)
-
             length_bytes = sock.recv(2)
             if len(length_bytes) < 2:
                 return []
             resp_length = struct.unpack(">H", length_bytes)[0]
-
             resp_data = b""
             while len(resp_data) < resp_length:
                 chunk = sock.recv(resp_length - len(resp_data))
@@ -112,7 +105,6 @@ def _resolve_via_dns_tcp(hostname: str, dns_server: str = "8.8.8.8", port: int =
                 resp_data += chunk
         finally:
             sock.close()
-
         return _parse_dns_response(resp_data)
     except Exception as e:
         _last_dns_debug.append(f"dns_tcp: {type(e).__name__}: {e}")
@@ -160,283 +152,125 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = _patched_getaddrinfo
 
-from models import MatchResult, TeamStats, HeadToHead, WeatherInfo, Fixture
-
-BBS_BASE = "https://api.bigballsdata.com"
-OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-GEOCODE_BASE = "https://geocoding-api.open-meteo.com/v1/search"
-
-_HARDCODED_API_KEY = "bbs_live_00000wG3lu4GGVHH6g1xu0Ceqq21F5i1v8lIgKFYxbF0Df0H"
-
-
-def _api_key() -> str:
-    key = _HARDCODED_API_KEY or os.environ.get("BBS_API_KEY", "")
-    if not key:
-        raise RuntimeError("BBS_API_KEY tanımlı değil.")
-    return key
+API_BASE = "https://v3.football.api-sports.io"
+_HARDCODED_API_KEY = "b7e3704ff369331fc8d57a5d6036a067"
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {_api_key()}"}
+    return {"x-apisports-key": _HARDCODED_API_KEY}
 
 
-def _get_with_retry(url: str, params: dict = None, max_retries: int = 3, timeout: float = 15) -> requests.Response:
-    last_resp = None
-    for attempt in range(max_retries):
+def _get(url: str, params: dict = None, timeout: float = 15):
+    try:
         resp = requests.get(url, headers=_headers(), params=params, timeout=timeout)
-        if resp.status_code != 429:
-            return resp
-        last_resp = resp
-        wait = int(resp.headers.get("Retry-After", 8))
-        time.sleep(max(wait, 3))
-    return last_resp
-
-
-FREE_LEAGUES = ["epl", "laliga", "bundesliga", "ligue1", "serie_a", "mls", "cl"]
-
-
-def _extract_team_name(side) -> str:
-    if isinstance(side, dict):
-        return side.get("team_name") or side.get("name") or ""
-    if isinstance(side, str):
-        return side
-    return ""
-
-
-def _fetch_one_league(league_code: str, date_str: Optional[str]) -> List[dict]:
-    try:
-        url = f"{BBS_BASE}/v1/matches"
-        params = {"sport": "football", "league": league_code, "limit": 100}
-        if date_str:
-            params["date"] = date_str
-
-        resp = _get_with_retry(url, params)
-        if resp is None or resp.status_code != 200:
-            return []
-
-        payload = resp.json()
-        matches = payload.get("data", [])
-
-        results = []
-        for m in matches:
-            home_side = m.get("home")
-            away_side = m.get("away")
-            home_name = _extract_team_name(home_side)
-            away_name = _extract_team_name(away_side)
-            if not home_name or not away_name:
-                continue
-
-            score = m.get("score") or {}
-            status_raw = (m.get("status") or score.get("status") or "scheduled").lower()
-            status = "FINISHED" if status_raw == "finished" else (
-                "SCHEDULED" if status_raw in ("scheduled", "postponed") else status_raw.upper()
-            )
-
-            home_goals = score.get("home")
-            away_goals = score.get("away")
-
-            results.append({
-                "home": home_name,
-                "away": away_name,
-                "home_id": home_name,
-                "away_id": away_name,
-                "utc_date": m.get("start_time", ""),
-                "league": league_code,
-                "status": status,
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "ht_home_goals": None,
-                "ht_away_goals": None,
-            })
-        return results
-    except Exception:
-        return []
-
-
-# ----------------------------------------------------------------------
-# 1) FİKSTÜR (Bülten) ÇEKME - PARALEL
-# ----------------------------------------------------------------------
-def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 80,
-                             date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[dict]:
-    code = (competition_code or "").strip().lower()
-    codes = [code] if code else FREE_LEAGUES
-    date_str = date_from or date_to
-
-    all_fixtures = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        future_map = {
-            executor.submit(_fetch_one_league, c, date_str): c
-            for c in codes
-        }
-        for future in as_completed(future_map):
-            try:
-                all_fixtures.extend(future.result())
-            except Exception:
-                continue
-
-    all_fixtures.sort(key=lambda fx: fx.get("utc_date", ""))
-    return all_fixtures[:limit]
-
-
-# ----------------------------------------------------------------------
-# 2) TAKIM İSTATİSTİKLERİ - /v1/standings kullanır (ID GEREKTİRMEZ)
-# ----------------------------------------------------------------------
-_standings_cache = {}
-_last_team_fetch_debug = []
-
-
-def _names_match(a: str, b: str) -> bool:
-    a_norm = a.strip().lower()
-    b_norm = b.strip().lower()
-    if a_norm == b_norm:
-        return True
-    return a_norm in b_norm or b_norm in a_norm
-
-
-def _fetch_standings(league_code: str) -> list:
-    if league_code in _standings_cache:
-        return _standings_cache[league_code]
-    try:
-        url = f"{BBS_BASE}/v1/standings"
-        params = {"league": league_code, "sport": "football"}
-        resp = _get_with_retry(url, params)
-        if resp is None or resp.status_code != 200:
-            _last_team_fetch_debug.append(f"standings({league_code}): HTTP {resp.status_code if resp else '?'}")
-            _standings_cache[league_code] = []
-            return []
-        data = resp.json().get("data", {})
-        rows = data.get("rows", [])
-        _standings_cache[league_code] = rows
-        return rows
+        return resp
     except Exception as e:
-        _last_team_fetch_debug.append(f"standings({league_code}): istisna {type(e).__name__}: {e}")
-        _standings_cache[league_code] = []
-        return []
+        raise RuntimeError(f"Baglanti hatasi: {type(e).__name__}: {e}")
 
 
-def build_team_stats(team_name: str, league_code: str) -> TeamStats:
+# ----------------------------------------------------------------------
+# 1) FİKSTÜR (Bülten) ÇEKME - TEK İSTEKLE TÜM LİGLER
+# ----------------------------------------------------------------------
+def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
+                             date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[dict]:
     """
-    Lig puan durumundan (standings) sezon ortalaması gol istatistiği
-    çeker. Lig için veri yoksa (örn. MLS - henüz desteklenmiyor) HATA
-    VERMEZ, TeamStats'i boş bırakır; modül otomatik olarak nötr (1.2)
-    varsayılana düşer.
+    Belirtilen tarihteki maçları TÜM liglerden TEK istekle çeker
+    (API-Football'ın /fixtures?date=X uç noktası zaten global taramadır).
     """
-    rows = _fetch_standings(league_code)
-    stats = TeamStats(name=team_name)
+    date_str = date_from or date_to or datetime.utcnow().strftime("%Y-%m-%d")
 
-    match_row = None
-    for row in rows:
-        row_name = row.get("team_name", "")
-        if _names_match(row_name, team_name):
-            match_row = row
-            break
+    resp = _get(f"{API_BASE}/fixtures", params={"date": date_str})
+    if resp.status_code != 200:
+        raise RuntimeError(f"Fikstur alinamadi: HTTP {resp.status_code} - {resp.text[:200]}")
 
-    if match_row and match_row.get("played", 0) > 0:
-        played = match_row["played"]
-        stats.season_avg_goals_for = match_row.get("goals_for", 0) / played
-        stats.season_avg_goals_against = match_row.get("goals_against", 0) / played
-        won = match_row.get("won", 0)
-        drawn = match_row.get("drawn", 0)
-        max_points = played * 3
-        actual_points = won * 3 + drawn
-        stats.season_form_score = actual_points / max_points if max_points else 0.5
-    else:
-        available_names = [r.get("team_name", "?") for r in rows][:8]
-        _last_team_fetch_debug.append(
-            f"'{team_name}' bulunamadi (lig: {league_code}, satir sayisi: {len(rows)}, mevcut isimler: {available_names})"
-        )
+    payload = resp.json()
+    matches = payload.get("response", [])
 
-    stats.squad_market_value_eur = load_market_value(team_name)
-    return stats
+    fixtures = []
+    for m in matches:
+        fixture_info = m.get("fixture", {})
+        league_info = m.get("league", {})
+        teams = m.get("teams", {})
+        goals = m.get("goals", {})
 
+        status_short = (fixture_info.get("status") or {}).get("short", "NS")
+        is_finished = status_short in ("FT", "AET", "PEN")
+        status = "FINISHED" if is_finished else "SCHEDULED"
 
-def fetch_team_recent_matches(team_id: str, limit: int = 10) -> List[MatchResult]:
-    return []
+        fixtures.append({
+            "fixture_id": fixture_info.get("id"),
+            "home": (teams.get("home") or {}).get("name", "?"),
+            "away": (teams.get("away") or {}).get("name", "?"),
+            "home_id": (teams.get("home") or {}).get("id"),
+            "away_id": (teams.get("away") or {}).get("id"),
+            "utc_date": fixture_info.get("date", ""),
+            "league": league_info.get("name", ""),
+            "status": status,
+            "home_goals": goals.get("home"),
+            "away_goals": goals.get("away"),
+            "ht_home_goals": None,
+            "ht_away_goals": None,
+        })
 
-
-def fetch_head_to_head(match_id: str, limit: int = 5) -> HeadToHead:
-    return HeadToHead(matches=[])
-
-
-# ----------------------------------------------------------------------
-# 3) KADRO PİYASA DEĞERİ
-# ----------------------------------------------------------------------
-_MARKET_VALUE_CSV = os.path.join(os.path.dirname(__file__), "data", "market_values.csv")
-
-
-def load_market_value(team_name: str) -> float:
-    if not os.path.exists(_MARKET_VALUE_CSV):
-        return 0.0
-    with open(_MARKET_VALUE_CSV, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row["team_name"].strip().lower() == team_name.strip().lower():
-                try:
-                    return float(row["market_value_eur"])
-                except (ValueError, KeyError):
-                    return 0.0
-    return 0.0
+    fixtures.sort(key=lambda fx: fx.get("utc_date", ""))
+    return fixtures[:limit]
 
 
 # ----------------------------------------------------------------------
-# 4) HAVA DURUMU
+# 2) TAHMİN - API-Football'un kendi hazır motoru
 # ----------------------------------------------------------------------
-def fetch_city_coordinates(city_name: str) -> Optional[dict]:
-    resp = requests.get(GEOCODE_BASE, params={"name": city_name, "count": 1}, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    results = data.get("results")
-    if not results:
-        return None
-    r = results[0]
-    return {"lat": r["latitude"], "lon": r["longitude"]}
-
-
-def fetch_weather(city_name: str, match_date: str) -> WeatherInfo:
-    coords = fetch_city_coordinates(city_name)
-    if not coords:
-        return WeatherInfo()
-
-    params = {
-        "latitude": coords["lat"],
-        "longitude": coords["lon"],
-        "daily": "temperature_2m_max,precipitation_sum,windspeed_10m_max",
-        "timezone": "auto",
-        "start_date": match_date,
-        "end_date": match_date,
+def fetch_prediction(fixture_id: int) -> dict:
+    """
+    Belirli bir maç için API-Football'un hazır tahminini döner.
+    Dönüş: {
+        "home_pct": float, "draw_pct": float, "away_pct": float,
+        "winner_name": str veya None, "advice": str,
+        "under_over": str veya None,
+        "goals_home": str, "goals_away": str,
+        "form_home": str, "form_away": str,
+        "att_home": str, "att_away": str,
+        "def_home": str, "def_away": str,
     }
-    try:
-        resp = requests.get(OPEN_METEO_BASE, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        daily = data.get("daily", {})
-        temp = daily.get("temperature_2m_max", [None])[0]
-        precip = daily.get("precipitation_sum", [None])[0]
-        wind = daily.get("windspeed_10m_max", [None])[0]
-        condition = "yağışlı" if (precip or 0) > 1 else "açık"
-        return WeatherInfo(temperature_c=temp, precipitation_mm=precip,
-                            wind_kmh=wind, condition=condition)
-    except requests.RequestException:
-        return WeatherInfo()
+    """
+    resp = _get(f"{API_BASE}/predictions", params={"fixture": fixture_id})
+    if resp.status_code != 200:
+        raise RuntimeError(f"Tahmin alinamadi: HTTP {resp.status_code} - {resp.text[:200]}")
 
+    payload = resp.json()
+    response_list = payload.get("response", [])
+    if not response_list:
+        raise RuntimeError("Bu mac icin tahmin verisi bulunamadi (yeterli gecmis veri olmayabilir).")
 
-def build_fixture(raw_fixture: dict) -> Fixture:
-    league_code = raw_fixture.get("league", "epl")
-    home_stats = build_team_stats(raw_fixture["home"], league_code)
-    away_stats = build_team_stats(raw_fixture["away"], league_code)
+    item = response_list[0]
+    pred = item.get("predictions", {})
+    comparison = item.get("comparison", {})
+    teams = item.get("teams", {})
 
-    match_date = raw_fixture["utc_date"][:10] if raw_fixture.get("utc_date") else \
-        datetime.utcnow().strftime("%Y-%m-%d")
+    percent = pred.get("percent", {}) or {}
 
-    weather = fetch_weather(raw_fixture["home"], match_date)
+    def _pct(val):
+        try:
+            return float(str(val).replace("%", ""))
+        except (TypeError, ValueError):
+            return 0.0
 
-    return Fixture(
-        home_team=raw_fixture["home"],
-        away_team=raw_fixture["away"],
-        league=raw_fixture.get("league", ""),
-        kickoff=raw_fixture.get("utc_date", ""),
-        home_stats=home_stats,
-        away_stats=away_stats,
-        h2h=None,
-        weather=weather,
-    )
+    winner = pred.get("winner") or {}
+    goals = pred.get("goals", {}) or {}
+
+    return {
+        "home_pct": _pct(percent.get("home", "0")),
+        "draw_pct": _pct(percent.get("draw", "0")),
+        "away_pct": _pct(percent.get("away", "0")),
+        "winner_name": winner.get("name"),
+        "winner_comment": winner.get("comment", ""),
+        "advice": pred.get("advice", ""),
+        "under_over": pred.get("under_over"),
+        "goals_home": goals.get("home", "?"),
+        "goals_away": goals.get("away", "?"),
+        "form_home": (comparison.get("form", {}) or {}).get("home", "?"),
+        "form_away": (comparison.get("form", {}) or {}).get("away", "?"),
+        "att_home": (comparison.get("att", {}) or {}).get("home", "?"),
+        "att_away": (comparison.get("att", {}) or {}).get("away", "?"),
+        "def_home": (comparison.get("def", {}) or {}).get("home", "?"),
+        "def_away": (comparison.get("def", {}) or {}).get("away", "?"),
+    }
