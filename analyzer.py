@@ -287,3 +287,93 @@ def evaluate_actual_result(home_goals: int, away_goals: int,
             hit.add("2_YARI_COK_GOLLU")
 
     return hit
+
+
+def analyze_from_expected_goals(lambda_home: float, lambda_away: float,
+                                 home_name: str, away_name: str) -> AnalysisResult:
+    """
+    Zaten hesaplanmış (örn. API-Football'un tahmin ettiği) beklenen gol
+    sayılarını doğrudan alıp TÜM pazarları (MS1/MSX/MS2, alt/üst, KG var/yok,
+    İY/MS kombinasyonları vb.) hesaplar. compute_expected_goals() adımını
+    ATLAR - dışarıdan gelen lambda değerlerini doğrudan kullanır.
+    """
+    lambda_home = max(0.2, min(4.5, lambda_home))
+    lambda_away = max(0.2, min(4.5, lambda_away))
+
+    matrix = build_score_matrix(lambda_home, lambda_away)
+    fh_matrix, sh_matrix = _half_matrices(lambda_home, lambda_away)
+
+    home_marginal = _row_sums(matrix)
+    away_marginal = _col_sums(matrix)
+
+    probabilities: Dict[str, float] = {}
+    probabilities.update(_match_result_probs(matrix))
+    probabilities.update(_btts_probs(matrix))
+    for line in (1.5, 2.5, 3.5):
+        probabilities.update(_over_under_probs(matrix, line))
+
+    fh_expected = lambda_home * FIRST_HALF_GOAL_RATIO + lambda_away * FIRST_HALF_GOAL_RATIO
+    sh_expected = (lambda_home + lambda_away) - fh_expected
+    total_half = fh_expected + sh_expected
+    probabilities["1_YARI_COK_GOLLU"] = fh_expected / total_half if total_half else 0.5
+    probabilities["2_YARI_COK_GOLLU"] = sh_expected / total_half if total_half else 0.5
+
+    probabilities.update(_iy_ms_combinations(fh_matrix, matrix))
+
+    fh_result = _match_result_probs(fh_matrix)
+    sh_result = _match_result_probs(sh_matrix)
+    probabilities["IY_SADECE_1"] = fh_result["MS1"]
+    probabilities["IY_SADECE_X"] = fh_result["MSX"]
+    probabilities["IY_SADECE_2"] = fh_result["MS2"]
+    probabilities["2Y_SADECE_1"] = sh_result["MS1"]
+    probabilities["2Y_SADECE_X"] = sh_result["MSX"]
+    probabilities["2Y_SADECE_2"] = sh_result["MS2"]
+
+    home_ou = _team_goals_over_under(home_marginal, 1.5)
+    away_ou = _team_goals_over_under(away_marginal, 1.5)
+    probabilities["EV_GOL_UST_1.5"] = home_ou["UST"]
+    probabilities["EV_GOL_ALT_1.5"] = home_ou["ALT"]
+    probabilities["DEP_GOL_UST_1.5"] = away_ou["UST"]
+    probabilities["DEP_GOL_ALT_1.5"] = away_ou["ALT"]
+
+    n = len(matrix)
+    p_home_win_btts_yes = sum(
+        matrix[i][j] for i in range(1, n) for j in range(1, n) if i > j
+    )
+    p_away_win_btts_yes = sum(
+        matrix[i][j] for i in range(1, n) for j in range(1, n) if j > i
+    )
+    probabilities["EV_GALIBIYET_KG_VAR"] = p_home_win_btts_yes
+    probabilities["EV_GALIBIYET_KG_YOK"] = probabilities["MS1"] - p_home_win_btts_yes
+    probabilities["DEP_GALIBIYET_KG_VAR"] = p_away_win_btts_yes
+    probabilities["DEP_GALIBIYET_KG_YOK"] = probabilities["MS2"] - p_away_win_btts_yes
+
+    sorted_probs = sorted(probabilities.items(), key=lambda x: x[1], reverse=True)
+
+    top_picks = [
+        {"market": k, "probability": round(float(v) * 100, 1)}
+        for k, v in sorted_probs[:3]
+    ]
+
+    surprise_candidates = [
+        (k, v) for k, v in sorted_probs if 0.10 <= v <= 0.30
+    ]
+    surprise_picks = [
+        {"market": k, "probability": round(float(v) * 100, 1)}
+        for k, v in surprise_candidates[:3]
+    ]
+
+    fixture = Fixture(home_team=home_name, away_team=away_name)
+
+    return AnalysisResult(
+        fixture=fixture,
+        probabilities={k: round(float(v) * 100, 1) for k, v in probabilities.items()},
+        top_picks=top_picks,
+        surprise_picks=surprise_picks,
+        expected_goals={"home": round(float(lambda_home), 2), "away": round(float(lambda_away), 2)},
+        confidence_note=(
+            "Beklenen gol tahmini API-Football'un istatistiksel modelinden "
+            "alınmıştır; pazar olasılıkları buradan Poisson dağılımıyla "
+            "hesaplanmıştır. Gelecekteki sonucun garantisi değildir."
+        ),
+    )
