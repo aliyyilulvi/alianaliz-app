@@ -3,6 +3,7 @@
 main.py
 -------
 AliAnaliz uygulamasının Kivy giriş noktası.
+Veri/analiz kaynağı: API-Football'ın hazır tahmin motoru.
 """
 
 import threading
@@ -19,8 +20,6 @@ from kivy.metrics import dp
 from datetime import datetime, timedelta, date
 
 import data_fetcher
-from analyzer import analyze_fixture, evaluate_actual_result
-from market_labels import market_label
 
 KV_FILE = "alianaliz.kv"
 
@@ -127,20 +126,17 @@ class BultenScreen(Screen):
         date_str = self.selected_date.isoformat()
         threading.Thread(
             target=self._fetch_worker,
-            args=(date_str, date_str),
+            args=(date_str,),
             daemon=True,
         ).start()
 
-    def _fetch_worker(self, date_from, date_to):
+    def _fetch_worker(self, date_str):
         try:
             fixtures = data_fetcher.fetch_upcoming_fixtures(
-                "", limit=80, date_from=date_from, date_to=date_to
+                "", limit=100, date_from=date_str, date_to=date_str
             )
             self._on_fixtures_loaded(fixtures)
         except Exception as e:
-            import traceback
-            from kivy.logger import Logger
-            Logger.error("ALIANALIZ: TAM HATA:\n" + traceback.format_exc())
             self._on_error(str(e))
 
     @mainthread
@@ -192,79 +188,89 @@ class AnalizScreen(Screen):
         self.home_team = raw_fixture["home"]
         self.away_team = raw_fixture["away"]
         self.loading = True
-        self.status_text = "Takım formu ve hava durumu verileri toplanıyor..."
+        self.status_text = "API-Football tahmin motoru sorgulanıyor..."
         self.ids.results_box.clear_widgets()
+        self._raw_fixture = raw_fixture
         threading.Thread(target=self._analyze_worker, args=(raw_fixture,), daemon=True).start()
 
     def _analyze_worker(self, raw_fixture: dict):
         try:
-            fixture = data_fetcher.build_fixture(raw_fixture)
-            result = analyze_fixture(fixture)
-            self._on_analysis_done(result, raw_fixture)
+            prediction = data_fetcher.fetch_prediction(raw_fixture["fixture_id"])
+            self._on_analysis_done(prediction, raw_fixture)
         except Exception as e:
-            import traceback
-            from kivy.logger import Logger
-            Logger.error("ALIANALIZ: TAM HATA:\n" + traceback.format_exc())
             self._on_error(str(e))
 
     @mainthread
-    def _on_analysis_done(self, result, raw_fixture):
+    def _on_analysis_done(self, prediction, raw_fixture):
         self.loading = False
         self.status_text = ""
         box = self.ids.results_box
 
         is_finished = raw_fixture.get("status") == "FINISHED" and raw_fixture.get("home_goals") is not None
-        hit_markets = set()
+
         if is_finished:
-            hit_markets = evaluate_actual_result(
-                raw_fixture["home_goals"], raw_fixture["away_goals"],
-                raw_fixture.get("ht_home_goals"), raw_fixture.get("ht_away_goals"),
-            )
+            hg, ag = raw_fixture["home_goals"], raw_fixture["away_goals"]
+            actual_winner = self.home_team if hg > ag else (self.away_team if ag > hg else None)
+            predicted_winner = prediction.get("winner_name")
+            hit = (actual_winner == predicted_winner) or (actual_winner is None and predicted_winner is None)
+
             score_lbl = Label(
-                text=f"GERCEKLESEN SONUC: {self.home_team} {raw_fixture['home_goals']} - {raw_fixture['away_goals']} {self.away_team}",
+                text=f"GERCEKLESEN SONUC: {self.home_team} {hg} - {ag} {self.away_team}",
                 bold=True, size_hint_y=None, height=dp(40),
                 color=(0.20, 0.85, 0.45, 1), halign="center", valign="middle"
             )
-            score_lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+            self._bind_ts(score_lbl, box)
             box.add_widget(score_lbl)
-            hint_lbl = Label(
-                text="Yesil + isaretli satirlar gercekte TUTAN tahminlerdir.",
-                size_hint_y=None, height=dp(24), font_size="11sp",
-                color=(0.949, 0.600, 0.290, 0.8), halign="center", valign="middle"
+
+            hit_lbl = Label(
+                text=("✓ Tahmin edilen kazanan DOGRU CIKTI!" if hit else "✗ Tahmin edilen kazanan tutmadi."),
+                bold=True, size_hint_y=None, height=dp(30),
+                color=(0.20, 0.85, 0.45, 1) if hit else (0.85, 0.35, 0.35, 1),
+                halign="center", valign="middle"
             )
-            hint_lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
-            box.add_widget(hint_lbl)
+            self._bind_ts(hit_lbl, box)
+            box.add_widget(hit_lbl)
 
-        eg = result.expected_goals
-        box.add_widget(self._section_title(
-            f"Beklenen Gol (xG benzeri): {self.home_team} {eg['home']}  -  {eg['away']} {self.away_team}"
-        ))
+        box.add_widget(self._section_title("API-FOOTBALL TAHMİNİ (6 algoritma ortalaması)"))
 
-        box.add_widget(self._section_title("İSTATİSTİKSEL OLARAK ÖNE ÇIKAN SEÇİMLER"))
-        for pick in result.top_picks:
-            box.add_widget(self._pick_row(pick["market"], pick["probability"], pick["market"] in hit_markets))
+        pct_row = BoxLayout(size_hint_y=None, height=dp(60), spacing=dp(6))
+        pct_row.add_widget(self._pct_box(f"{self.home_team}\n%{prediction['home_pct']:.0f}"))
+        pct_row.add_widget(self._pct_box(f"Berabere\n%{prediction['draw_pct']:.0f}"))
+        pct_row.add_widget(self._pct_box(f"{self.away_team}\n%{prediction['away_pct']:.0f}"))
+        box.add_widget(pct_row)
 
-        box.add_widget(self._section_title("DÜŞÜK OLASILIKLI SÜRPRİZ SENARYOLAR"))
-        if result.surprise_picks:
-            for pick in result.surprise_picks:
-                box.add_widget(self._pick_row(pick["market"], pick["probability"], pick["market"] in hit_markets))
-        else:
-            lbl = Label(text="Bu maç için belirgin bir sürpriz senaryo bulunamadı.",
-                        size_hint_y=None, height=dp(30), halign="center")
-            lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
-            box.add_widget(lbl)
+        if prediction.get("winner_name"):
+            box.add_widget(self._info_row("Tahmin Edilen Kazanan", prediction["winner_name"]))
+        if prediction.get("under_over"):
+            box.add_widget(self._info_row("Alt/Üst Tahmini", str(prediction["under_over"])))
+        box.add_widget(self._info_row("Beklenen Gol Araligi (Ev)", str(prediction.get("goals_home", "?"))))
+        box.add_widget(self._info_row("Beklenen Gol Araligi (Dep)", str(prediction.get("goals_away", "?"))))
 
-        box.add_widget(self._section_title("TÜM PAZARLAR (Detaylı Olasılık Tablosu)"))
-        for market, prob in sorted(result.probabilities.items()):
-            box.add_widget(self._pick_row(market, prob, market in hit_markets, small=True))
+        if prediction.get("advice"):
+            advice_lbl = Label(
+                text=f"Tavsiye: {prediction['advice']}",
+                size_hint_y=None, height=dp(50), italic=True,
+                color=(0.949, 0.600, 0.290, 1), halign="center", valign="middle"
+            )
+            self._bind_ts(advice_lbl, box)
+            box.add_widget(advice_lbl)
+
+        box.add_widget(self._section_title("TAKIM KARŞILAŞTIRMASI"))
+        box.add_widget(self._compare_row("Form", prediction.get("form_home"), prediction.get("form_away")))
+        box.add_widget(self._compare_row("Hücum Gücü", prediction.get("att_home"), prediction.get("att_away")))
+        box.add_widget(self._compare_row("Savunma Gücü", prediction.get("def_home"), prediction.get("def_away")))
 
         note_label = Label(
-            text=result.confidence_note,
-            size_hint_y=None, height=dp(60), color=(0.949, 0.600, 0.290, 1),
+            text="Bu tahmin API-Football'un istatistiksel modeline aittir; gelecekteki sonucun garantisi değildir.",
+            size_hint_y=None, height=dp(60), color=(0.949, 0.600, 0.290, 0.8),
             italic=True, halign="center", valign="middle"
         )
-        note_label.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        self._bind_ts(note_label, box)
         box.add_widget(note_label)
+
+    def _bind_ts(self, label, box):
+        label.text_size = (box.width, None)
+        label.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
 
     @mainthread
     def _on_error(self, message: str):
@@ -274,26 +280,39 @@ class AnalizScreen(Screen):
     def _section_title(self, text):
         lbl = Label(text=text, bold=True, size_hint_y=None, height=dp(44),
                      color=(0.949, 0.600, 0.290, 1), halign="center", valign="middle")
+        lbl.text_size = (self.ids.results_box.width, None)
         lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
         return lbl
 
-    def _pick_row(self, market_code, prob, hit=False, small=False):
-        row = BoxLayout(size_hint_y=None, height=dp(30 if small else 40),
-                         padding=[dp(4), 0])
-        label_text = market_label(market_code)
-        if hit:
-            label_text = "✓ " + label_text
-        market_color = (0.20, 0.85, 0.45, 1) if hit else (0.9, 0.88, 0.92, 1)
-        market_lbl = Label(text=label_text, halign="left", valign="middle",
-                            color=market_color, bold=hit,
-                            font_size="11sp" if small else "13sp",
-                            size_hint_x=0.68)
-        market_lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
-        row.add_widget(market_lbl)
+    def _pct_box(self, text):
+        lbl = Label(text=text, halign="center", valign="middle",
+                     color=(0.969, 0.949, 0.980, 1), bold=True, font_size="13sp")
+        lbl.bind(size=lambda i, v: setattr(i, "text_size", v))
+        return lbl
 
-        prob_color = (0.20, 0.85, 0.45, 1) if hit else (0.949, 0.600, 0.290, 1)
-        row.add_widget(Label(text=f"%{prob}", halign="right", bold=(not small) or hit,
-                              color=prob_color, size_hint_x=0.32))
+    def _info_row(self, label_text, value_text):
+        row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(4), 0])
+        lbl = Label(text=label_text, halign="left", valign="middle",
+                     color=(0.9, 0.88, 0.92, 1), font_size="12sp", size_hint_x=0.6)
+        lbl.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        row.add_widget(lbl)
+        val = Label(text=value_text, halign="right", valign="middle",
+                     color=(0.949, 0.600, 0.290, 1), bold=True, font_size="12sp", size_hint_x=0.4)
+        val.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        row.add_widget(val)
+        return row
+
+    def _compare_row(self, label, home_val, away_val):
+        row = BoxLayout(size_hint_y=None, height=dp(32), padding=[dp(4), 0])
+        h = Label(text=str(home_val or "?"), halign="left", color=(0.9, 0.88, 0.92, 1), font_size="12sp")
+        h.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        row.add_widget(h)
+        c = Label(text=label, halign="center", color=(0.949, 0.600, 0.290, 1), bold=True, font_size="11sp")
+        c.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        row.add_widget(c)
+        a = Label(text=str(away_val or "?"), halign="right", color=(0.9, 0.88, 0.92, 1), font_size="12sp")
+        a.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
+        row.add_widget(a)
         return row
 
 
