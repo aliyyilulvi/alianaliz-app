@@ -16,6 +16,11 @@ alt/üst tahmini, hücum/savunma gücü karşılaştırması ve H2H veriyor.
 Bu yüzden:
   - Bülten yüklerken TEK bir istek atılır (/fixtures?date=X, tüm ligler).
   - Analiz sadece kullanıcı "Analiz Et"e bastığında (1 istek) yapılır.
+
+v2.1 - LİG FİLTRESİ:
+Bülten artık SADECE majör ligler ve o ülkelerin 1./2. ligleri ile
+sınırlı (ALLOWED_LEAGUE_IDS). Bilinmeyen/küçük/amatör ligler bültende
+görünmez.
 """
 
 import os
@@ -169,13 +174,70 @@ def _get(url: str, params: dict = None, timeout: float = 15):
 
 
 # ----------------------------------------------------------------------
-# 1) FİKSTÜR (Bülten) ÇEKME - TEK İSTEKLE TÜM LİGLER
+# 0) İZİN VERİLEN LİGLER - Majör ligler + o ülkelerin 1./2. ligleri
+# ----------------------------------------------------------------------
+# API-Football lig ID'leri. Bilinmeyen/küçük ligleri (3. lig, amatör,
+# gençlik vb.) dışarıda bırakmak için bültende SADECE bu listedeki
+# ligler gösterilir. Yeni bir lig eklemek/çıkarmak istersen bu
+# sözlüğü düzenlemen yeterli (ID: "isim" şeklinde).
+ALLOWED_LEAGUE_IDS = {
+    # --- Türkiye ---
+    203: "Süper Lig",
+    204: "1. Lig",
+
+    # --- İngiltere ---
+    39: "Premier League",
+    40: "Championship",
+
+    # --- İspanya ---
+    140: "La Liga",
+    141: "La Liga 2 (Segunda División)",
+
+    # --- İtalya ---
+    135: "Serie A",
+    136: "Serie B",
+
+    # --- Almanya ---
+    78: "Bundesliga",
+    79: "2. Bundesliga",
+
+    # --- Fransa ---
+    61: "Ligue 1",
+    62: "Ligue 2",
+
+    # --- Portekiz / Hollanda / Belçika ---
+    94: "Primeira Liga",
+    88: "Eredivisie",
+    144: "Jupiler Pro League",
+
+    # --- Avrupa kupaları ---
+    2: "UEFA Champions League",
+    3: "UEFA Europa League",
+    848: "UEFA Europa Conference League",
+
+    # --- Milli takım turnuvaları ---
+    1: "Dünya Kupası",
+    4: "Avrupa Şampiyonası (Euro)",
+
+    # --- Diğer büyük ligler ---
+    253: "MLS (ABD)",
+}
+
+
+def _is_allowed_league(league_id: Optional[int]) -> bool:
+    return league_id in ALLOWED_LEAGUE_IDS
+
+
+# ----------------------------------------------------------------------
+# 1) FİKSTÜR (Bülten) ÇEKME - TEK İSTEKLE TÜM LİGLER, SONRA FİLTRELEME
 # ----------------------------------------------------------------------
 def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
                              date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[dict]:
     """
     Belirtilen tarihteki maçları TÜM liglerden TEK istekle çeker
-    (API-Football'ın /fixtures?date=X uç noktası zaten global taramadır).
+    (API-Football'ın /fixtures?date=X uç noktası zaten global taramadır),
+    sonra sadece ALLOWED_LEAGUE_IDS içindeki (majör + 1./2. lig) maçları
+    döner. Bilinmeyen/küçük ligler bültende görünmez.
     """
     date_str = date_from or date_to or datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -193,6 +255,10 @@ def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
         teams = m.get("teams", {})
         goals = m.get("goals", {})
 
+        league_id = league_info.get("id")
+        if not _is_allowed_league(league_id):
+            continue
+
         status_short = (fixture_info.get("status") or {}).get("short", "NS")
         is_finished = status_short in ("FT", "AET", "PEN")
         status = "FINISHED" if is_finished else "SCHEDULED"
@@ -205,6 +271,7 @@ def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
             "away_id": (teams.get("away") or {}).get("id"),
             "utc_date": fixture_info.get("date", ""),
             "league": league_info.get("name", ""),
+            "league_id": league_id,
             "status": status,
             "home_goals": goals.get("home"),
             "away_goals": goals.get("away"),
