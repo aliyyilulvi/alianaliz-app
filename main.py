@@ -11,6 +11,12 @@ Bülten artık sadece maç listesi göstermiyor. O güne ait TÜM ana lig +
 sonuçtan en düşüğe doğru SIRALANMIŞ şekilde gösteriliyor. Bir maça
 tıklandığında zaten önceden çekilmiş tahmin verisi kullanıldığı için
 API'ye tekrar istek atılmıyor (istek limitini korumak için).
+
+v2.2 - DETAYLI ANALİZ EKRANI:
+Analiz ekranı artık sadece yüzdeleri değil; Poisson dağılımı, H2H
+üstünlük yüzdesi, her iki takımın sezon istatistikleri (galibiyet/
+beraberlik/mağlubiyet, attığı/yediği gol) ve son 5 karşılaşmanın
+sonuçlarını da gösteriyor.
 """
 
 import threading
@@ -343,9 +349,33 @@ class AnalizScreen(Screen):
             box.add_widget(advice_lbl)
 
         box.add_widget(self._section_title("TAKIM KARŞILAŞTIRMASI"))
-        box.add_widget(self._compare_row("Form", prediction.get("form_home"), prediction.get("form_away")))
+        box.add_widget(self._compare_row("Form (Yüzde)", prediction.get("form_home"), prediction.get("form_away")))
         box.add_widget(self._compare_row("Hücum Gücü", prediction.get("att_home"), prediction.get("att_away")))
         box.add_widget(self._compare_row("Savunma Gücü", prediction.get("def_home"), prediction.get("def_away")))
+        box.add_widget(self._compare_row("Poisson Dağılımı", prediction.get("poisson_home"), prediction.get("poisson_away")))
+        box.add_widget(self._compare_row("H2H Üstünlük", prediction.get("h2h_pct"), ""))
+
+        home_season = prediction.get("home_season") or {}
+        away_season = prediction.get("away_season") or {}
+        if home_season or away_season:
+            box.add_widget(self._section_title("SEZON PERFORMANSI"))
+            box.add_widget(self._info_row(
+                f"{self.home_team} - Son 5 Maç Formu", str(home_season.get("form", "?"))))
+            box.add_widget(self._info_row(
+                f"{self.away_team} - Son 5 Maç Formu", str(away_season.get("form", "?"))))
+            box.add_widget(self._season_stats_row(self.home_team, self.away_team, home_season, away_season))
+
+        h2h_matches = prediction.get("h2h_matches") or []
+        if h2h_matches:
+            box.add_widget(self._section_title(f"ÖNCEKİ KARŞILAŞMALAR ({len(h2h_matches)})"))
+            for match_line in h2h_matches:
+                h2h_lbl = Label(
+                    text=match_line, size_hint_y=None, height=dp(26),
+                    color=(0.9, 0.88, 0.92, 1), font_size="12sp",
+                    halign="center", valign="middle"
+                )
+                self._bind_ts(h2h_lbl, box)
+                box.add_widget(h2h_lbl)
 
         note_label = Label(
             text="Bu tahmin API-Football'un istatistiksel modeline aittir; gelecekteki sonucun garantisi değildir.",
@@ -401,6 +431,40 @@ class AnalizScreen(Screen):
         a.bind(size=lambda i, v: setattr(i, "text_size", (v[0], None)))
         row.add_widget(a)
         return row
+
+    def _season_stats_row(self, home_team, away_team, home_season, away_season):
+        """Galibiyet/Beraberlik/Maglubiyet ve Attigi/Yedigi gol tablosu."""
+        outer = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(110), spacing=dp(4))
+
+        header = BoxLayout(size_hint_y=None, height=dp(24))
+        for txt, hint in ((home_team, 0.4), ("", 0.2), (away_team, 0.4)):
+            lbl = Label(text=txt, bold=True, color=(0.949, 0.600, 0.290, 1),
+                        font_size="11sp", size_hint_x=hint, halign="center")
+            lbl.bind(size=lambda i, v: setattr(i, "text_size", v))
+            header.add_widget(lbl)
+        outer.add_widget(header)
+
+        def _stat_line(label_text, home_val, away_val):
+            r = BoxLayout(size_hint_y=None, height=dp(24))
+            h = Label(text=str(home_val), color=(0.9, 0.88, 0.92, 1), font_size="12sp", size_hint_x=0.4, halign="center")
+            h.bind(size=lambda i, v: setattr(i, "text_size", v))
+            r.add_widget(h)
+            c = Label(text=label_text, color=(0.7, 0.65, 0.75, 1), font_size="10sp", size_hint_x=0.2, halign="center")
+            c.bind(size=lambda i, v: setattr(i, "text_size", v))
+            r.add_widget(c)
+            a = Label(text=str(away_val), color=(0.9, 0.88, 0.92, 1), font_size="12sp", size_hint_x=0.4, halign="center")
+            a.bind(size=lambda i, v: setattr(i, "text_size", v))
+            r.add_widget(a)
+            return r
+
+        outer.add_widget(_stat_line("Oynanan", home_season.get("played"), away_season.get("played")))
+        outer.add_widget(_stat_line("G / B / M",
+                          f"{home_season.get('wins')}/{home_season.get('draws')}/{home_season.get('loses')}",
+                          f"{away_season.get('wins')}/{away_season.get('draws')}/{away_season.get('loses')}"))
+        outer.add_widget(_stat_line("Attığı Gol", home_season.get("goals_for"), away_season.get("goals_for")))
+        outer.add_widget(_stat_line("Yediği Gol", home_season.get("goals_against"), away_season.get("goals_against")))
+
+        return outer
 
 
 class AliAnalizScreenManager(ScreenManager):
