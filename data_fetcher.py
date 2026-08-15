@@ -289,15 +289,11 @@ def fetch_upcoming_fixtures(competition_code: str = "", limit: int = 100,
 def fetch_prediction(fixture_id: int) -> dict:
     """
     Belirli bir maç için API-Football'un hazır tahminini döner.
-    Dönüş: {
-        "home_pct": float, "draw_pct": float, "away_pct": float,
-        "winner_name": str veya None, "advice": str,
-        "under_over": str veya None,
-        "goals_home": str, "goals_away": str,
-        "form_home": str, "form_away": str,
-        "att_home": str, "att_away": str,
-        "def_home": str, "def_away": str,
-    }
+    v2.2: Sadece yüzdeler değil, sezon istatistikleri (galibiyet/beraberlik/
+    maglubiyet, gol averaji), son 5 maç formu ve H2H (iki takımın önceki
+    karşılaşmaları) da dahil edildi - ekran artık çok daha detaylı.
+
+    Eksik/boş gelen alanlar None yerine "Veri yok" ile doldurulur.
     """
     resp = _get(f"{API_BASE}/predictions", params={"fixture": fixture_id})
     if resp.status_code != 200:
@@ -309,9 +305,10 @@ def fetch_prediction(fixture_id: int) -> dict:
         raise RuntimeError("Bu mac icin tahmin verisi bulunamadi (yeterli gecmis veri olmayabilir).")
 
     item = response_list[0]
-    pred = item.get("predictions", {})
-    comparison = item.get("comparison", {})
-    teams = item.get("teams", {})
+    pred = item.get("predictions", {}) or {}
+    comparison = item.get("comparison", {}) or {}
+    teams = item.get("teams", {}) or {}
+    h2h_raw = item.get("h2h", []) or []
 
     percent = pred.get("percent", {}) or {}
 
@@ -321,25 +318,84 @@ def fetch_prediction(fixture_id: int) -> dict:
         except (TypeError, ValueError):
             return 0.0
 
+    def _s(val, default="Veri yok"):
+        """Bos/None degerleri temiz bir Turkce metinle degistirir."""
+        if val is None or val == "" or val == "?":
+            return default
+        return str(val)
+
     winner = pred.get("winner") or {}
     goals = pred.get("goals", {}) or {}
+
+    def _team_season_stats(team_key: str) -> dict:
+        t = teams.get(team_key, {}) or {}
+        league_info = t.get("league", {}) or {}
+        fixtures_info = league_info.get("fixtures", {}) or {}
+        goals_info = league_info.get("goals", {}) or {}
+
+        played = (fixtures_info.get("played", {}) or {}).get("total")
+        wins = (fixtures_info.get("wins", {}) or {}).get("total")
+        draws = (fixtures_info.get("draws", {}) or {}).get("total")
+        loses = (fixtures_info.get("loses", {}) or {}).get("total")
+        goals_for = (goals_info.get("for", {}) or {}).get("total", {}).get("total") \
+            if isinstance(goals_info.get("for", {}), dict) else None
+        goals_against = (goals_info.get("against", {}) or {}).get("total", {}).get("total") \
+            if isinstance(goals_info.get("against", {}), dict) else None
+
+        return {
+            "form": _s(league_info.get("form"), "?"),
+            "played": played if played is not None else "?",
+            "wins": wins if wins is not None else "?",
+            "draws": draws if draws is not None else "?",
+            "loses": loses if loses is not None else "?",
+            "goals_for": goals_for if goals_for is not None else "?",
+            "goals_against": goals_against if goals_against is not None else "?",
+        }
+
+    def _format_h2h(matches: list, home_name: str, away_name: str) -> list:
+        """Son 5 h2h maci 'TakimA 2-1 TakimB' formatinda ozetler."""
+        formatted = []
+        # En yeniler ustte olacak sekilde ters cevir (API genelde eskiden yeniye verir)
+        for m in list(reversed(matches))[:5]:
+            fx = m.get("fixture", {}) or {}
+            tm = m.get("teams", {}) or {}
+            gl = m.get("goals", {}) or {}
+            h_name = (tm.get("home") or {}).get("name", "?")
+            a_name = (tm.get("away") or {}).get("name", "?")
+            h_goals = gl.get("home")
+            a_goals = gl.get("away")
+            date_str = (fx.get("date") or "")[:10]
+            if h_goals is None or a_goals is None:
+                continue
+            formatted.append(f"{h_name} {h_goals}-{a_goals} {a_name}  ({date_str})")
+        return formatted
+
+    home_name = (teams.get("home") or {}).get("name", "Ev Sahibi")
+    away_name = (teams.get("away") or {}).get("name", "Deplasman")
 
     return {
         "home_pct": _pct(percent.get("home", "0")),
         "draw_pct": _pct(percent.get("draw", "0")),
         "away_pct": _pct(percent.get("away", "0")),
         "winner_name": winner.get("name"),
-        "winner_comment": winner.get("comment", ""),
-        "advice": pred.get("advice", ""),
-        "under_over": pred.get("under_over"),
-        "goals_home": goals.get("home", "?"),
-        "goals_away": goals.get("away", "?"),
-        "form_home": (comparison.get("form", {}) or {}).get("home", "?"),
-        "form_away": (comparison.get("form", {}) or {}).get("away", "?"),
-        "att_home": (comparison.get("att", {}) or {}).get("home", "?"),
-        "att_away": (comparison.get("att", {}) or {}).get("away", "?"),
-        "def_home": (comparison.get("def", {}) or {}).get("home", "?"),
-        "def_away": (comparison.get("def", {}) or {}).get("away", "?"),
+        "winner_comment": _s(winner.get("comment"), ""),
+        "advice": _s(pred.get("advice"), "Yeterli veri yok"),
+        "under_over": _s(pred.get("under_over"), "Belirtilmemis"),
+        "goals_home": _s(goals.get("home")),
+        "goals_away": _s(goals.get("away")),
+        "form_home": _s((comparison.get("form", {}) or {}).get("home")),
+        "form_away": _s((comparison.get("form", {}) or {}).get("away")),
+        "att_home": _s((comparison.get("att", {}) or {}).get("home")),
+        "att_away": _s((comparison.get("att", {}) or {}).get("away")),
+        "def_home": _s((comparison.get("def", {}) or {}).get("home")),
+        "def_away": _s((comparison.get("def", {}) or {}).get("away")),
+        "poisson_home": _s((comparison.get("poisson_distribution", {}) or {}).get("home")),
+        "poisson_away": _s((comparison.get("poisson_distribution", {}) or {}).get("away")),
+        "h2h_pct": _s((comparison.get("h2h", {}) or {}).get("home")),
+        "win_or_draw": pred.get("win_or_draw", False),
+        "home_season": _team_season_stats("home"),
+        "away_season": _team_season_stats("away"),
+        "h2h_matches": _format_h2h(h2h_raw, home_name, away_name),
     }
 
 
