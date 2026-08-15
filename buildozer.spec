@@ -5,7 +5,7 @@ package.domain = org.alianaliz
 source.dir = .
 source.include_exts = py,kv,csv,png,jpg,ttf,atlas
 version = 1.0.0
-requirements = python3==3.11.8,kivy==2.3.1,requests,certifi,urllib3,chardet,idna,pyjnius
+requirements = python3==3.11.8,hostpython3==3.11.8,kivy==2.3.1,requests,certifi,urllib3,chardet,idna,pyjnius
 p4a.branch = develop
 orientation = portrait
 fullscreen = 0
