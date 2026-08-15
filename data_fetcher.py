@@ -341,3 +341,66 @@ def fetch_prediction(fixture_id: int) -> dict:
         "def_home": (comparison.get("def", {}) or {}).get("home", "?"),
         "def_away": (comparison.get("def", {}) or {}).get("away", "?"),
     }
+
+
+# ----------------------------------------------------------------------
+# 3) TOPLU ANALİZ - Tüm bültendeki maçları analiz edip yüzdeye göre sırala
+# ----------------------------------------------------------------------
+def fetch_all_predictions(fixtures: List[dict], max_requests: int = 90,
+                           progress_callback=None) -> "tuple[List[dict], List[dict]]":
+    """
+    Verilen fikstür listesindeki HER maç için API-Football'un tahminini
+    çeker ve en yüksek olasılıklı sonuca (ev/beraberlik/deplasman
+    yüzdelerinin en büyüğü) göre BÜYÜKTEN KÜÇÜĞE sıralanmış halde döner.
+
+    Dönüş: (analyzed, skipped)
+      - analyzed: [{"fixture":..., "prediction":..., "best_pct":..., "best_side":...}, ...]
+        best_side "home" / "draw" / "away" değerlerinden biridir.
+        En yüksek olasılıklı maç listenin başındadır.
+      - skipped: analiz edilemeyen (istek limiti dolduğu için atlanan ya da
+        API hata verdiği için başarısız olan) fikstürlerin ham listesi.
+
+    ÖNEMLİ: Ücretsiz API planında GÜNDE SADECE 100 istek var. Bülten
+    çekmek zaten 1 istek harcadığı için, güvenlik payı bırakmak amacıyla
+    varsayılan olarak en fazla max_requests (90) maç analiz edilir.
+    Zaten bitmiş (FINISHED) maçlar analiz edilmez, otomatik atlanır.
+    """
+    analyzed: List[dict] = []
+    skipped: List[dict] = []
+
+    active_fixtures = [fx for fx in fixtures if fx.get("status") != "FINISHED"]
+
+    for i, fx in enumerate(active_fixtures):
+        if i >= max_requests:
+            skipped.append(fx)
+            continue
+
+        if progress_callback:
+            try:
+                progress_callback(i + 1, min(len(active_fixtures), max_requests))
+            except Exception:
+                pass
+
+        try:
+            pred = fetch_prediction(fx["fixture_id"])
+        except Exception:
+            skipped.append(fx)
+            continue
+
+        best_pct = max(pred["home_pct"], pred["draw_pct"], pred["away_pct"])
+        if best_pct == pred["home_pct"]:
+            best_side = "home"
+        elif best_pct == pred["away_pct"]:
+            best_side = "away"
+        else:
+            best_side = "draw"
+
+        analyzed.append({
+            "fixture": fx,
+            "prediction": pred,
+            "best_pct": best_pct,
+            "best_side": best_side,
+        })
+
+    analyzed.sort(key=lambda a: a["best_pct"], reverse=True)
+    return analyzed, skipped
