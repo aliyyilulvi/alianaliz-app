@@ -4,6 +4,13 @@ main.py
 -------
 AliAnaliz uygulamasının Kivy giriş noktası.
 Veri/analiz kaynağı: API-Football'ın hazır tahmin motoru.
+
+v2 - OTOMATİK TOPLU ANALİZ:
+Bülten artık sadece maç listesi göstermiyor. O güne ait TÜM ana lig +
+1./2. lig maçları otomatik olarak analiz ediliyor ve en yüksek olasılıklı
+sonuçtan en düşüğe doğru SIRALANMIŞ şekilde gösteriliyor. Bir maça
+tıklandığında zaten önceden çekilmiş tahmin verisi kullanıldığı için
+API'ye tekrar istek atılmıyor (istek limitini korumak için).
 """
 
 import threading
@@ -27,6 +34,8 @@ _TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
               "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
 _TR_DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
 
+_SIDE_LABELS = {"home": "Ev Sahibi", "draw": "Beraberlik", "away": "Deplasman"}
+
 
 def _format_date_tr(d: date) -> str:
     return f"{d.day} {_TR_MONTHS[d.month - 1]} {d.year}  ({_TR_DAYS[d.weekday()]})"
@@ -37,7 +46,9 @@ class MatchRow(BoxLayout):
     away_team = StringProperty("")
     league = StringProperty("")
     kickoff = StringProperty("")
+    pct_text = StringProperty("")
     raw_fixture = None
+    cached_prediction = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -51,6 +62,16 @@ class MatchRow(BoxLayout):
             Color(0.216, 0.086, 0.325, 1)
             self._bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[10])
         self.bind(pos=self._update_bg, size=self._update_bg)
+
+        # Sol taraf: yüzdelik olasılık rozeti
+        self._pct_label = Label(
+            text=self.pct_text,
+            size_hint_x=None, width=dp(56),
+            color=(0.949, 0.600, 0.290, 1), bold=True, font_size="16sp",
+            halign="center", valign="middle",
+        )
+        self._pct_label.bind(size=lambda i, v: setattr(i, "text_size", v))
+        self.add_widget(self._pct_label)
 
         text_box = BoxLayout(orientation="vertical")
 
@@ -85,6 +106,7 @@ class MatchRow(BoxLayout):
         self.bind(
             home_team=self._refresh_title, away_team=self._refresh_title,
             league=self._refresh_sub, kickoff=self._refresh_sub,
+            pct_text=self._refresh_pct,
         )
 
     def _update_bg(self, *args):
@@ -102,6 +124,9 @@ class MatchRow(BoxLayout):
 
     def _refresh_sub(self, *args):
         self._sub_label.text = self.league + "  |  " + self.kickoff
+
+    def _refresh_pct(self, *args):
+        self._pct_label.text = self.pct_text
 
 
 class BultenScreen(Screen):
@@ -135,36 +160,87 @@ class BultenScreen(Screen):
             fixtures = data_fetcher.fetch_upcoming_fixtures(
                 "", limit=100, date_from=date_str, date_to=date_str
             )
-            self._on_fixtures_loaded(fixtures)
+            self._all_fixtures = fixtures
+
+            if not fixtures:
+                self._on_fixtures_loaded([], [], [])
+                return
+
+            self._set_status(f"{len(fixtures)} maç bulundu. Analiz ediliyor...")
+
+            def _progress(done, total):
+                self._set_status(f"Maçlar analiz ediliyor... ({done}/{total})")
+
+            analyzed, skipped = data_fetcher.fetch_all_predictions(
+                fixtures, max_requests=90, progress_callback=_progress
+            )
+            finished = [fx for fx in fixtures if fx.get("status") == "FINISHED"]
+            self._on_fixtures_loaded(analyzed, skipped, finished)
         except Exception as e:
             self._on_error(str(e))
 
     @mainthread
-    def _on_fixtures_loaded(self, fixtures):
+    def _set_status(self, text):
+        self.status_text = text
+
+    @mainthread
+    def _on_fixtures_loaded(self, analyzed, skipped, finished):
         self.loading = False
-        self._all_fixtures = fixtures
-        if not fixtures:
+        total = len(analyzed) + len(skipped) + len(finished)
+        if total == 0:
             self.status_text = f"{self.date_display} tarihinde maç bulunamadı."
         else:
-            self.status_text = f"{len(fixtures)} maç bulundu ({self.date_display})."
-        self._render_fixtures(fixtures)
+            msg = f"{len(analyzed)} maç analiz edildi ve olasılığa göre sıralandı ({self.date_display})."
+            if skipped:
+                msg += f" ({len(skipped)} maç günlük istek limiti nedeniyle analiz edilemedi.)"
+            self.status_text = msg
+        self._render_fixtures(analyzed, skipped, finished)
 
-    def _render_fixtures(self, fixtures):
+    def _render_fixtures(self, analyzed, skipped, finished):
         self.ids.match_list.clear_widgets()
-        for fx in fixtures:
-            is_finished = fx.get("status") == "FINISHED"
-            if is_finished and fx.get("home_goals") is not None:
-                second_line = f"{fx.get('league','')}  |  Sonuc: {fx['home_goals']}-{fx['away_goals']} (Bitti)"
-            else:
-                second_line = f"{fx.get('league','')}  |  {fx.get('utc_date','')[:16].replace('T',' ')}"
+
+        # 1) En yüksek olasılıklıdan en düşüğe: analiz edilmiş maçlar
+        for item in analyzed:
+            fx = item["fixture"]
+            pred = item["prediction"]
+            pct = item["best_pct"]
+            side_label = _SIDE_LABELS.get(item["best_side"], "")
+
+            second_line = f"{fx.get('league','')}  |  {fx.get('utc_date','')[:16].replace('T',' ')}"
 
             row = MatchRow(
                 home_team=fx["home"], away_team=fx["away"],
-                league=second_line, kickoff=""
+                league=second_line, kickoff="",
+                pct_text=f"%{pct:.0f}",
             )
             row.raw_fixture = fx
-            row.select_btn.text = "Sonucu Gor" if is_finished else "Analiz Et"
-            row.select_btn.bind(on_release=lambda inst, f=fx: self.go_to_analysis(f))
+            row.cached_prediction = pred
+            row.select_btn.text = "Detay"
+            row.select_btn.bind(on_release=lambda inst, f=fx, p=pred: self.go_to_analysis(f, p))
+            self.ids.match_list.add_widget(row)
+
+        # 2) Zaten bitmiş maçlar (analiz edilmez, sonuç gösterilir)
+        for fx in finished:
+            second_line = f"{fx.get('league','')}  |  Sonuc: {fx.get('home_goals')}-{fx.get('away_goals')} (Bitti)"
+            row = MatchRow(
+                home_team=fx["home"], away_team=fx["away"],
+                league=second_line, kickoff="", pct_text="",
+            )
+            row.raw_fixture = fx
+            row.select_btn.text = "Sonucu Gor"
+            row.select_btn.bind(on_release=lambda inst, f=fx: self.go_to_analysis(f, None))
+            self.ids.match_list.add_widget(row)
+
+        # 3) İstek limiti nedeniyle analiz edilemeyenler (en altta, manuel analiz için)
+        for fx in skipped:
+            second_line = f"{fx.get('league','')}  |  {fx.get('utc_date','')[:16].replace('T',' ')}  (analiz edilmedi)"
+            row = MatchRow(
+                home_team=fx["home"], away_team=fx["away"],
+                league=second_line, kickoff="", pct_text="",
+            )
+            row.raw_fixture = fx
+            row.select_btn.text = "Analiz Et"
+            row.select_btn.bind(on_release=lambda inst, f=fx: self.go_to_analysis(f, None))
             self.ids.match_list.add_widget(row)
 
     @mainthread
@@ -172,9 +248,9 @@ class BultenScreen(Screen):
         self.loading = False
         self.status_text = f"Hata: {message}"
 
-    def go_to_analysis(self, raw_fixture: dict):
+    def go_to_analysis(self, raw_fixture: dict, cached_prediction: dict = None):
         app = App.get_running_app()
-        app.root.get_screen("analiz").load_fixture(raw_fixture)
+        app.root.get_screen("analiz").load_fixture(raw_fixture, cached_prediction)
         app.root.current = "analiz"
 
 
@@ -184,13 +260,21 @@ class AnalizScreen(Screen):
     home_team = StringProperty("")
     away_team = StringProperty("")
 
-    def load_fixture(self, raw_fixture: dict):
+    def load_fixture(self, raw_fixture: dict, cached_prediction: dict = None):
         self.home_team = raw_fixture["home"]
         self.away_team = raw_fixture["away"]
+        self._raw_fixture = raw_fixture
+        self.ids.results_box.clear_widgets()
+
+        if cached_prediction is not None:
+            # Bülten ekranında zaten analiz edilmiş - tekrar API isteği ATMA.
+            self.loading = False
+            self.status_text = ""
+            self._on_analysis_done(cached_prediction, raw_fixture)
+            return
+
         self.loading = True
         self.status_text = "API-Football tahmin motoru sorgulanıyor..."
-        self.ids.results_box.clear_widgets()
-        self._raw_fixture = raw_fixture
         threading.Thread(target=self._analyze_worker, args=(raw_fixture,), daemon=True).start()
 
     def _analyze_worker(self, raw_fixture: dict):
@@ -211,7 +295,7 @@ class AnalizScreen(Screen):
         if is_finished:
             hg, ag = raw_fixture["home_goals"], raw_fixture["away_goals"]
             actual_winner = self.home_team if hg > ag else (self.away_team if ag > hg else None)
-            predicted_winner = prediction.get("winner_name")
+            predicted_winner = prediction.get("winner_name") if prediction else None
             hit = (actual_winner == predicted_winner) or (actual_winner is None and predicted_winner is None)
 
             score_lbl = Label(
@@ -230,6 +314,9 @@ class AnalizScreen(Screen):
             )
             self._bind_ts(hit_lbl, box)
             box.add_widget(hit_lbl)
+
+        if not prediction:
+            return
 
         box.add_widget(self._section_title("API-FOOTBALL TAHMİNİ (6 algoritma ortalaması)"))
 
